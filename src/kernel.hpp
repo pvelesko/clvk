@@ -329,32 +329,32 @@ struct cvk_kernel_argument_values {
                 }
 
                 m_kernel_resources[arg.binding] = sampler;
-            } else {
-                // TODO: special elif the arg is a device pointer
-                // first check if the arg device pointer is in the map
-                // Create a new cvk_mem object for the device pointer
-                auto device_ptr = *reinterpret_cast<const cl_mem_device_address_EXT*>(value);
-                auto device_to_buffer_map = m_entry_point->program()->context()->device()->device_to_buffer_map;
+            } else if (arg.kind == kernel_argument_kind::buffer) {
+                auto device_ptr =
+                    *reinterpret_cast<const cl_mem_device_address_EXT*>(value);
+                auto device_to_buffer_map = m_entry_point->program()
+                                                ->context()
+                                                ->device()
+                                                ->device_to_buffer_map;
                 auto it = device_to_buffer_map.find((void*)device_ptr);
                 if (it == device_to_buffer_map.end()) {
-                    // Handle error case - pointer not found
-                    // Perhaps throw an exception or handle appropriately
-                    auto apimem = *reinterpret_cast<const cl_mem*>(value);
-                    if (apimem == nullptr) {
-                        return CL_INVALID_MEM_OBJECT;
-                    }
-                    auto mem = icd_downcast(apimem);
-                    if (!mem->is_valid()) {
                     return CL_INVALID_MEM_OBJECT;
-                    }
-                    m_kernel_resources[arg.binding] = mem;
                 }
-                
 
                 // device pointer found in map, swapping the buffer pointer
                 auto buffer_ptr_raw = it->second;
                 auto buffer_ptr = reinterpret_cast<cvk_buffer*>(buffer_ptr_raw);
                 m_kernel_resources[arg.binding] = buffer_ptr;
+            } else {
+                auto apimem = *reinterpret_cast<const cl_mem*>(value);
+                if (apimem == nullptr) {
+                    return CL_INVALID_MEM_OBJECT;
+                }
+                auto mem = icd_downcast(apimem);
+                if (!mem->is_valid()) {
+                    return CL_INVALID_MEM_OBJECT;
+                }
+                m_kernel_resources[arg.binding] = mem;
             }
         }
 
