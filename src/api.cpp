@@ -6147,6 +6147,7 @@ cl_int clSetKernelArgDevicePointerEXT_fn(cl_kernel kernel, cl_uint arg_index, cl
     auto const& arg = kern->arguments()[arg_index];
 
     // Validate argument is a pointer type
+    // device pointer kernel argument of type __global is buffer type here so failure
     // if (!arg.is_pod_pointer()) {
     //     return CL_INVALID_ARG_VALUE;
     // }
