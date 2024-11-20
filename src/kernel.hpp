@@ -330,6 +330,7 @@ struct cvk_kernel_argument_values {
 
                 m_kernel_resources[arg.binding] = sampler;
             } else {
+                // TODO: special elif the arg is a device pointer
                 // first check if the arg device pointer is in the map
                 // Create a new cvk_mem object for the device pointer
                 auto device_ptr = *reinterpret_cast<const cl_mem_device_address_EXT*>(value);
