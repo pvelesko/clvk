@@ -124,6 +124,8 @@ struct cvk_command_pool {
     void lock() { m_lock.lock(); }
 
     void unlock() { m_lock.unlock(); }
+    
+    VkCommandPool vulkan_command_pool() const { return m_command_pool; }
 
 private:
     cvk_device* m_device;
@@ -209,6 +211,8 @@ struct cvk_command_queue : public _cl_command_queue,
     void command_pool_unlock() { m_command_pool.unlock(); }
 
     cvk_vulkan_queue_wrapper& vulkan_queue() { return m_vulkan_queue; }
+    
+    VkCommandPool vulkan_command_pool() const { return m_command_pool.vulkan_command_pool(); }
 
     cvk_device* device() const { return m_device; }
     cl_command_queue_properties properties() const { return m_properties; }

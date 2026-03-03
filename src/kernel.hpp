@@ -56,6 +56,7 @@ struct cvk_kernel : public _cl_kernel, api_object<object_magic::kernel> {
     void set_image_metadata(cl_uint index, const void* image);
 
     CHECK_RETURN cl_int set_arg(cl_uint index, size_t size, const void* value);
+    CHECK_RETURN cl_int set_arg_usm_pointer(cl_uint index, VkBuffer buffer);
     CHECK_RETURN VkPipeline
     create_pipeline(const cvk_spec_constant_map& spec_constants);
 
@@ -190,7 +191,8 @@ struct cvk_kernel_argument_values {
           m_kernel_resources(other.m_kernel_resources),
           m_local_args_size(other.m_local_args_size),
           m_specialization_constants(other.m_specialization_constants),
-          m_args_set(other.m_args_set), m_descriptor_sets{VK_NULL_HANDLE},
+          m_args_set(other.m_args_set), m_usm_buffers(other.m_usm_buffers),
+          m_descriptor_sets{VK_NULL_HANDLE},
           m_descriptor_sets_refcount(0) {}
 
     ~cvk_kernel_argument_values() {
@@ -350,6 +352,19 @@ struct cvk_kernel_argument_values {
         return m_kernel_resources[arg.binding];
     }
 
+    void set_usm_buffer(uint32_t binding, VkBuffer buffer) {
+        m_usm_buffers[binding] = buffer;
+    }
+
+    VkBuffer get_usm_buffer(uint32_t binding) const {
+        auto it = m_usm_buffers.find(binding);
+        return (it != m_usm_buffers.end()) ? it->second : VK_NULL_HANDLE;
+    }
+
+    void set_arg_as_set(uint32_t pos) {
+        m_args_set[pos] = true;
+    }
+
     bool is_enqueued() const { return m_is_enqueued; }
 
     const std::vector<uint8_t>& pod_data() const { return *m_pod_data; }
@@ -399,6 +414,10 @@ struct cvk_kernel_argument_values {
         mems.reserve(m_args.size());
         for (auto& arg : m_args) {
             if (arg.is_mem_object_backed()) {
+                // Skip USM buffers - they don't have cvk_mem objects
+                if (m_usm_buffers.find(arg.binding) != m_usm_buffers.end()) {
+                    continue;
+                }
                 auto mem =
                     static_cast<cvk_mem*>(m_kernel_resources[arg.binding]);
                 mems.push_back(mem);
@@ -435,6 +454,7 @@ private:
     std::vector<size_t> m_local_args_size;
     std::unordered_map<uint32_t, uint32_t> m_specialization_constants;
     std::vector<bool> m_args_set;
+    std::unordered_map<uint32_t, VkBuffer> m_usm_buffers;  // USM buffer bindings
 
     std::unique_ptr<cvk_buffer> m_pod_buffer;
     std::array<VkDescriptorSet, spir_binary::MAX_DESCRIPTOR_SETS>

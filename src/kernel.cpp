@@ -177,6 +177,34 @@ cl_int cvk_kernel::set_arg(cl_uint index, size_t size, const void* value) {
     return ret;
 }
 
+cl_int cvk_kernel::set_arg_usm_pointer(cl_uint index, VkBuffer buffer) {
+    std::lock_guard<std::mutex> lock(m_lock);
+
+    // Clone argument values if they have been used in an enqueue
+    if (m_argument_values->is_enqueued()) {
+        m_argument_values =
+            cvk_kernel_argument_values::create(*m_argument_values);
+        if (m_argument_values == nullptr) {
+            return CL_OUT_OF_RESOURCES;
+        }
+    }
+
+    auto const& arg = m_args[index];
+
+    // Validate this is a buffer argument
+    if (arg.kind != kernel_argument_kind::buffer &&
+        arg.kind != kernel_argument_kind::buffer_ubo) {
+        cvk_error_fn("argument %u is not a buffer (kind=%d)", index, (int)arg.kind);
+        return CL_INVALID_ARG_VALUE;
+    }
+
+    // Store the USM VkBuffer in the argument values
+    m_argument_values->set_usm_buffer(arg.binding, buffer);
+    m_argument_values->set_arg_as_set(arg.pos);
+    
+    return CL_SUCCESS;
+}
+
 bool cvk_kernel::args_valid() const { return m_argument_values->args_valid(); }
 
 bool cvk_kernel_argument_values::setup_descriptor_sets() {
@@ -279,20 +307,33 @@ bool cvk_kernel_argument_values::setup_descriptor_sets() {
 
         case kernel_argument_kind::buffer:
         case kernel_argument_kind::buffer_ubo: {
-            auto buffer = static_cast<cvk_buffer*>(get_arg_value(arg));
-            if (buffer == nullptr) {
-                cvk_debug_fn("ignoring NULL buffer argument");
-                break;
+            VkBuffer vkbuf;
+            VkDeviceSize offset = 0;
+            VkDeviceSize size = VK_WHOLE_SIZE;
+            
+            // Check if this is a USM buffer
+            auto usm_buffer = get_usm_buffer(arg.binding);
+            if (usm_buffer != VK_NULL_HANDLE) {
+                vkbuf = usm_buffer;
+                cvk_debug_fn("USM buffer %p @ set = %u, binding = %u",
+                             (void*)usm_buffer, arg.descriptorSet, arg.binding);
+            } else {
+                auto buffer = static_cast<cvk_buffer*>(get_arg_value(arg));
+                if (buffer == nullptr) {
+                    cvk_debug_fn("ignoring NULL buffer argument");
+                    break;
+                }
+                vkbuf = buffer->vulkan_buffer();
+                offset = buffer->vulkan_buffer_offset();
+                size = buffer->size();
+                cvk_debug_fn(
+                    "buffer %p, offset = %zu, size = %zu @ set = %u, binding = %u",
+                    (void*)vkbuf, offset, size, arg.descriptorSet, arg.binding);
             }
-            auto vkbuf = buffer->vulkan_buffer();
-            cvk_debug_fn(
-                "buffer %p, offset = %zu, size = %zu @ set = %u, binding = %u",
-                buffer->vulkan_buffer(), buffer->vulkan_buffer_offset(),
-                buffer->size(), arg.descriptorSet, arg.binding);
             VkDescriptorBufferInfo bufferInfo = {
                 vkbuf,
-                buffer->vulkan_buffer_offset(), // offset
-                buffer->size()};
+                offset,
+                size};
             buffer_info.push_back(bufferInfo);
 
             auto descriptor_type = arg.kind == kernel_argument_kind::buffer
