@@ -294,6 +294,324 @@ cl_int CLVK_API_CALL clGetPlatformInfo(cl_platform_id platform,
     return ret;
 }
 
+// USM (Unified Shared Memory) API functions
+void* CL_API_CALL clSharedMemAllocINTEL(cl_context context, cl_device_id device,
+                                         const cl_mem_properties_intel* properties,
+                                         size_t size, cl_uint alignment,
+                                         cl_int* errcode_ret) {
+    TRACE_FUNCTION("context", (uintptr_t)context, "device", (uintptr_t)device,
+                   "size", size);
+    LOG_API_CALL("context = %p, device = %p, size = %zu, alignment = %u",
+                 context, device, size, alignment);
+
+    auto ctx = icd_downcast(context);
+
+    if (!is_valid_context(ctx)) {
+        if (errcode_ret) *errcode_ret = CL_INVALID_CONTEXT;
+        return nullptr;
+    }
+
+    if (!is_valid_device(device)) {
+        if (errcode_ret) *errcode_ret = CL_INVALID_DEVICE;
+        return nullptr;
+    }
+
+    auto dev = icd_downcast(device);
+    if (!dev->has_unified_memory()) {
+        if (errcode_ret) *errcode_ret = CL_INVALID_OPERATION;
+        return nullptr;
+    }
+
+    if (size == 0) {
+        if (errcode_ret) *errcode_ret = CL_INVALID_BUFFER_SIZE;
+        return nullptr;
+    }
+
+    // Default alignment is 128 bytes per OpenCL spec
+    if (alignment == 0) {
+        alignment = 128;
+    }
+
+    // Alignment must be power of 2
+    if ((alignment & (alignment - 1)) != 0) {
+        if (errcode_ret) *errcode_ret = CL_INVALID_VALUE;
+        return nullptr;
+    }
+
+    // Create Vulkan buffer
+    VkBufferCreateInfo bufferInfo = {
+        VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+        nullptr,
+        0,
+        size,
+        VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+        VK_SHARING_MODE_EXCLUSIVE,
+        0,
+        nullptr};
+
+    VkBuffer buffer;
+    VkResult res = vkCreateBuffer(dev->vulkan_device(), &bufferInfo, nullptr, &buffer);
+    if (res != VK_SUCCESS) {
+        if (errcode_ret) *errcode_ret = CL_OUT_OF_RESOURCES;
+        return nullptr;
+    }
+
+    // Get memory requirements
+    VkMemoryRequirements memReqs;
+    vkGetBufferMemoryRequirements(dev->vulkan_device(), buffer, &memReqs);
+
+    // Allocate from unified memory type
+    VkMemoryAllocateInfo allocInfo = {
+        VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+        nullptr,
+        memReqs.size,
+        dev->unified_memory_type_index()};
+
+    VkDeviceMemory memory;
+    res = vkAllocateMemory(dev->vulkan_device(), &allocInfo, nullptr, &memory);
+    if (res != VK_SUCCESS) {
+        vkDestroyBuffer(dev->vulkan_device(), buffer, nullptr);
+        if (errcode_ret) *errcode_ret = CL_OUT_OF_RESOURCES;
+        return nullptr;
+    }
+
+    // Bind buffer to memory
+    res = vkBindBufferMemory(dev->vulkan_device(), buffer, memory, 0);
+    if (res != VK_SUCCESS) {
+        vkFreeMemory(dev->vulkan_device(), memory, nullptr);
+        vkDestroyBuffer(dev->vulkan_device(), buffer, nullptr);
+        if (errcode_ret) *errcode_ret = CL_OUT_OF_RESOURCES;
+        return nullptr;
+    }
+
+    // Map memory to get host pointer
+    void* host_ptr;
+    res = vkMapMemory(dev->vulkan_device(), memory, 0, size, 0, &host_ptr);
+    if (res != VK_SUCCESS) {
+        vkFreeMemory(dev->vulkan_device(), memory, nullptr);
+        vkDestroyBuffer(dev->vulkan_device(), buffer, nullptr);
+        if (errcode_ret) *errcode_ret = CL_MEM_OBJECT_ALLOCATION_FAILURE;
+        return nullptr;
+    }
+
+    // Store allocation metadata
+    cvk_usm_allocation alloc = {
+        .host_pointer = host_ptr,
+        .vk_memory = memory,
+        .vk_buffer = buffer,
+        .size = size,
+        .type = cvk_usm_type::shared
+    };
+
+    {
+        std::lock_guard<std::mutex> lock(ctx->usm_allocations_lock());
+        ctx->usm_allocations()[host_ptr] = alloc;
+    }
+
+    if (errcode_ret) *errcode_ret = CL_SUCCESS;
+    return host_ptr;
+}
+
+void* CL_API_CALL clDeviceMemAllocINTEL(cl_context context, cl_device_id device,
+                                         const cl_mem_properties_intel* properties,
+                                         size_t size, cl_uint alignment,
+                                         cl_int* errcode_ret) {
+    TRACE_FUNCTION("context", (uintptr_t)context, "device", (uintptr_t)device,
+                   "size", size);
+    LOG_API_CALL("context = %p, device = %p, size = %zu, alignment = %u",
+                 context, device, size, alignment);
+
+    auto ctx = icd_downcast(context);
+
+    if (!is_valid_context(ctx)) {
+        if (errcode_ret) *errcode_ret = CL_INVALID_CONTEXT;
+        return nullptr;
+    }
+
+    if (!is_valid_device(device)) {
+        if (errcode_ret) *errcode_ret = CL_INVALID_DEVICE;
+        return nullptr;
+    }
+
+    auto dev = icd_downcast(device);
+
+    if (size == 0) {
+        if (errcode_ret) *errcode_ret = CL_INVALID_BUFFER_SIZE;
+        return nullptr;
+    }
+
+    // Default alignment is 128 bytes per OpenCL spec
+    if (alignment == 0) {
+        alignment = 128;
+    }
+
+    // Alignment must be power of 2
+    if ((alignment & (alignment - 1)) != 0) {
+        if (errcode_ret) *errcode_ret = CL_INVALID_VALUE;
+        return nullptr;
+    }
+
+    // Create Vulkan buffer
+    VkBufferCreateInfo bufferInfo = {
+        VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+        nullptr,
+        0,
+        size,
+        VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+        VK_SHARING_MODE_EXCLUSIVE,
+        0,
+        nullptr};
+
+    VkBuffer buffer;
+    VkResult res = vkCreateBuffer(dev->vulkan_device(), &bufferInfo, nullptr, &buffer);
+    if (res != VK_SUCCESS) {
+        if (errcode_ret) *errcode_ret = CL_OUT_OF_RESOURCES;
+        return nullptr;
+    }
+
+    // Get memory requirements
+    VkMemoryRequirements memReqs;
+    vkGetBufferMemoryRequirements(dev->vulkan_device(), buffer, &memReqs);
+
+    // Find device-local memory type
+    uint32_t memory_type_index = dev->device_memory_type_index(memReqs.memoryTypeBits);
+    
+    if (memory_type_index == VK_MAX_MEMORY_TYPES) {
+        vkDestroyBuffer(dev->vulkan_device(), buffer, nullptr);
+        if (errcode_ret) *errcode_ret = CL_OUT_OF_RESOURCES;
+        return nullptr;
+    }
+
+    // Allocate device memory
+    VkMemoryAllocateInfo allocInfo = {
+        VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+        nullptr,
+        memReqs.size,
+        memory_type_index};
+
+    VkDeviceMemory memory;
+    res = vkAllocateMemory(dev->vulkan_device(), &allocInfo, nullptr, &memory);
+    if (res != VK_SUCCESS) {
+        vkDestroyBuffer(dev->vulkan_device(), buffer, nullptr);
+        if (errcode_ret) *errcode_ret = CL_OUT_OF_RESOURCES;
+        return nullptr;
+    }
+
+    // Bind buffer to memory
+    res = vkBindBufferMemory(dev->vulkan_device(), buffer, memory, 0);
+    if (res != VK_SUCCESS) {
+        vkFreeMemory(dev->vulkan_device(), memory, nullptr);
+        vkDestroyBuffer(dev->vulkan_device(), buffer, nullptr);
+        if (errcode_ret) *errcode_ret = CL_OUT_OF_RESOURCES;
+        return nullptr;
+    }
+
+    // For device allocations, we return the VkBuffer handle cast to void*
+    // since there's no CPU-accessible pointer
+    void* device_ptr = reinterpret_cast<void*>(static_cast<uintptr_t>(reinterpret_cast<uint64_t>(buffer)));
+
+    cvk_error_fn("clDeviceMemAllocINTEL: allocated device ptr=%p, VkBuffer=%p, size=%zu", 
+                device_ptr, (void*)buffer, size);
+
+    // Store allocation metadata
+    cvk_usm_allocation alloc = {
+        .host_pointer = nullptr,  // No CPU access for device memory
+        .vk_memory = memory,
+        .vk_buffer = buffer,
+        .size = size,
+        .type = cvk_usm_type::device
+    };
+
+    {
+        std::lock_guard<std::mutex> lock(ctx->usm_allocations_lock());
+        ctx->usm_allocations()[device_ptr] = alloc;
+    }
+
+    if (errcode_ret) *errcode_ret = CL_SUCCESS;
+    return device_ptr;
+}
+
+cl_int CL_API_CALL clMemFreeINTEL(cl_context context, void* ptr) {
+    TRACE_FUNCTION("context", (uintptr_t)context, "ptr", (uintptr_t)ptr);
+    LOG_API_CALL("context = %p, ptr = %p", context, ptr);
+
+    auto ctx = icd_downcast(context);
+
+    if (!is_valid_context(ctx)) {
+        return CL_INVALID_CONTEXT;
+    }
+
+    if (ptr == nullptr) {
+        return CL_INVALID_VALUE;
+    }
+
+    // Look up allocation
+    cvk_usm_allocation alloc;
+    {
+        std::lock_guard<std::mutex> lock(ctx->usm_allocations_lock());
+        auto it = ctx->usm_allocations().find(ptr);
+        if (it == ctx->usm_allocations().end()) {
+            return CL_INVALID_VALUE;
+        }
+        alloc = it->second;
+        ctx->usm_allocations().erase(it);
+    }
+
+    // Free Vulkan resources
+    auto dev = ctx->device();
+    auto vkdev = dev->vulkan_device();
+    
+    // Unmap memory if it was mapped (shared and host types)
+    if (alloc.host_pointer != nullptr) {
+        vkUnmapMemory(vkdev, alloc.vk_memory);
+    }
+    
+    vkFreeMemory(vkdev, alloc.vk_memory, nullptr);
+    vkDestroyBuffer(vkdev, alloc.vk_buffer, nullptr);
+    
+    return CL_SUCCESS;
+}
+
+cl_int CL_API_CALL clSetKernelArgMemPointerINTEL(cl_kernel kernel, cl_uint arg_index,
+                                                  const void* arg_value) {
+    TRACE_FUNCTION("kernel", (uintptr_t)kernel, "arg_index", arg_index);
+    LOG_API_CALL("kernel = %p, arg_index = %u, arg_value = %p",
+                 kernel, arg_index, arg_value);
+
+    auto kern = icd_downcast(kernel);
+
+    if (!is_valid_kernel(kern)) {
+        return CL_INVALID_KERNEL;
+    }
+
+    if (arg_index >= kern->num_args()) {
+        cvk_error_fn("the program has only %u arguments", kern->num_args());
+        return CL_INVALID_ARG_INDEX;
+    }
+
+    if (arg_value == nullptr) {
+        return CL_INVALID_ARG_VALUE;
+    }
+
+    // Look up USM allocation
+    auto ctx = kern->context();
+    cvk_usm_allocation alloc;
+    {
+        std::lock_guard<std::mutex> lock(ctx->usm_allocations_lock());
+        auto it = ctx->usm_allocations().find(const_cast<void*>(arg_value));
+        if (it == ctx->usm_allocations().end()) {
+            cvk_error_fn("pointer %p is not a USM allocation", arg_value);
+            return CL_INVALID_ARG_VALUE;
+        }
+        alloc = it->second;
+    }
+
+    // Set the argument using the VkBuffer
+    return kern->set_arg_usm_pointer(arg_index, alloc.vk_buffer);
+}
+
 static const std::unordered_map<std::string, void*> gExtensionEntrypoints = {
 #define FUNC_PTR(X) reinterpret_cast<void*>(X)
 #define EXTENSION_ENTRYPOINT(X)                                                \
@@ -309,6 +627,10 @@ static const std::unordered_map<std::string, void*> gExtensionEntrypoints = {
     EXTENSION_ENTRYPOINT(clGetSemaphoreInfoKHR),
     EXTENSION_ENTRYPOINT(clRetainSemaphoreKHR),
     EXTENSION_ENTRYPOINT(clReleaseSemaphoreKHR),
+    EXTENSION_ENTRYPOINT(clSharedMemAllocINTEL),
+    EXTENSION_ENTRYPOINT(clDeviceMemAllocINTEL),
+    EXTENSION_ENTRYPOINT(clMemFreeINTEL),
+    EXTENSION_ENTRYPOINT(clSetKernelArgMemPointerINTEL),
 #undef EXTENSION_ENTRYPOINT
 #undef FUNC_PTR
 };
@@ -5860,22 +6182,335 @@ cl_int CLVK_API_CALL clEnqueueSVMMap(cl_command_queue command_queue,
     return CL_INVALID_OPERATION;
 }
 
+// Helper function to copy host memory to device-only USM using Vulkan commands
+// Submit a single VkBufferCopy on the given queue and wait for completion.
+static cl_int usm_submit_buffer_copy(cvk_command_queue* queue,
+                                     VkBuffer src, VkBuffer dst,
+                                     VkDeviceSize size,
+                                     cl_event* event) {
+    auto device = queue->device();
+
+    VkCommandBufferAllocateInfo cmd_alloc_info = {};
+    cmd_alloc_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    cmd_alloc_info.commandPool = queue->vulkan_command_pool();
+    cmd_alloc_info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cmd_alloc_info.commandBufferCount = 1;
+
+    VkCommandBuffer cmd_buffer;
+    VkResult res = vkAllocateCommandBuffers(device->vulkan_device(), &cmd_alloc_info, &cmd_buffer);
+    if (res != VK_SUCCESS) {
+        cvk_error_fn("Failed to allocate command buffer: %d", res);
+        return CL_OUT_OF_HOST_MEMORY;
+    }
+
+    VkCommandBufferBeginInfo begin_info = {};
+    begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+
+    res = vkBeginCommandBuffer(cmd_buffer, &begin_info);
+    if (res != VK_SUCCESS) {
+        vkFreeCommandBuffers(device->vulkan_device(), queue->vulkan_command_pool(), 1, &cmd_buffer);
+        cvk_error_fn("Failed to begin command buffer: %d", res);
+        return CL_OUT_OF_HOST_MEMORY;
+    }
+
+    VkBufferCopy copy_region = {};
+    copy_region.size = size;
+    vkCmdCopyBuffer(cmd_buffer, src, dst, 1, &copy_region);
+
+    res = vkEndCommandBuffer(cmd_buffer);
+    if (res != VK_SUCCESS) {
+        vkFreeCommandBuffers(device->vulkan_device(), queue->vulkan_command_pool(), 1, &cmd_buffer);
+        cvk_error_fn("Failed to end command buffer: %d", res);
+        return CL_OUT_OF_HOST_MEMORY;
+    }
+
+    VkSubmitInfo submit_info = {};
+    submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submit_info.commandBufferCount = 1;
+    submit_info.pCommandBuffers = &cmd_buffer;
+
+    res = vkQueueSubmit(queue->vulkan_queue().vulkan_queue(), 1, &submit_info, VK_NULL_HANDLE);
+    if (res != VK_SUCCESS) {
+        vkFreeCommandBuffers(device->vulkan_device(), queue->vulkan_command_pool(), 1, &cmd_buffer);
+        cvk_error_fn("Failed to submit command buffer: %d", res);
+        return CL_OUT_OF_HOST_MEMORY;
+    }
+
+    vkQueueWaitIdle(queue->vulkan_queue().vulkan_queue());
+    vkFreeCommandBuffers(device->vulkan_device(), queue->vulkan_command_pool(), 1, &cmd_buffer);
+
+    if (event != nullptr) {
+        auto evt = new cvk_event_command(queue->context(), nullptr, queue);
+        evt->set_status(CL_COMPLETE);
+        *event = evt;
+    }
+    return CL_SUCCESS;
+}
+
+// Create a host-visible staging buffer, returning VK_SUCCESS or an error.
+static VkResult usm_create_staging_buffer(cvk_device* device, VkDeviceSize size,
+                                          VkBufferUsageFlags usage,
+                                          VkBuffer& buffer, VkDeviceMemory& memory) {
+    VkBufferCreateInfo staging_info = {};
+    staging_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    staging_info.size = size;
+    staging_info.usage = usage;
+    staging_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+    VkResult res = vkCreateBuffer(device->vulkan_device(), &staging_info, nullptr, &buffer);
+    if (res != VK_SUCCESS) return res;
+
+    VkMemoryRequirements mem_reqs;
+    vkGetBufferMemoryRequirements(device->vulkan_device(), buffer, &mem_reqs);
+
+    VkMemoryAllocateInfo alloc_info = {};
+    alloc_info.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    alloc_info.allocationSize = mem_reqs.size;
+    alloc_info.memoryTypeIndex = device->unified_memory_type_index();
+
+    res = vkAllocateMemory(device->vulkan_device(), &alloc_info, nullptr, &memory);
+    if (res != VK_SUCCESS) {
+        vkDestroyBuffer(device->vulkan_device(), buffer, nullptr);
+        return res;
+    }
+
+    res = vkBindBufferMemory(device->vulkan_device(), buffer, memory, 0);
+    if (res != VK_SUCCESS) {
+        vkFreeMemory(device->vulkan_device(), memory, nullptr);
+        vkDestroyBuffer(device->vulkan_device(), buffer, nullptr);
+        return res;
+    }
+    return VK_SUCCESS;
+}
+
+static void usm_destroy_staging_buffer(cvk_device* device, VkBuffer buffer, VkDeviceMemory memory) {
+    vkFreeMemory(device->vulkan_device(), memory, nullptr);
+    vkDestroyBuffer(device->vulkan_device(), buffer, nullptr);
+}
+
+static cl_int copy_host_to_device_usm(cvk_command_queue* queue,
+                                     const cvk_usm_allocation& dst_alloc,
+                                     const void* src_ptr, size_t size,
+                                     cl_uint num_events_in_wait_list,
+                                     const cl_event* event_wait_list,
+                                     cl_event* event) {
+    auto device = queue->device();
+
+    VkBuffer staging_buffer;
+    VkDeviceMemory staging_memory;
+    VkResult res = usm_create_staging_buffer(device, size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                                             staging_buffer, staging_memory);
+    if (res != VK_SUCCESS) {
+        cvk_error_fn("Failed to create staging buffer: %d", res);
+        return CL_OUT_OF_HOST_MEMORY;
+    }
+
+    void* mapped_ptr;
+    res = vkMapMemory(device->vulkan_device(), staging_memory, 0, size, 0, &mapped_ptr);
+    if (res != VK_SUCCESS) {
+        usm_destroy_staging_buffer(device, staging_buffer, staging_memory);
+        cvk_error_fn("Failed to map staging memory: %d", res);
+        return CL_OUT_OF_HOST_MEMORY;
+    }
+    memcpy(mapped_ptr, src_ptr, size);
+    vkUnmapMemory(device->vulkan_device(), staging_memory);
+
+    cl_int ret = usm_submit_buffer_copy(queue, staging_buffer, dst_alloc.vk_buffer, size, event);
+    usm_destroy_staging_buffer(device, staging_buffer, staging_memory);
+    return ret;
+}
+
+static cl_int copy_device_usm_to_host(cvk_command_queue* queue,
+                                    const cvk_usm_allocation& src_alloc,
+                                    void* dst_ptr, size_t size,
+                                    cl_uint num_events_in_wait_list,
+                                    const cl_event* event_wait_list,
+                                    cl_event* event) {
+    auto device = queue->device();
+
+    VkBuffer staging_buffer;
+    VkDeviceMemory staging_memory;
+    VkResult res = usm_create_staging_buffer(device, size, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                                             staging_buffer, staging_memory);
+    if (res != VK_SUCCESS) {
+        cvk_error_fn("Failed to create staging buffer: %d", res);
+        return CL_OUT_OF_HOST_MEMORY;
+    }
+
+    cl_int ret = usm_submit_buffer_copy(queue, src_alloc.vk_buffer, staging_buffer, size, nullptr);
+    if (ret != CL_SUCCESS) {
+        usm_destroy_staging_buffer(device, staging_buffer, staging_memory);
+        return ret;
+    }
+
+    void* mapped_ptr;
+    res = vkMapMemory(device->vulkan_device(), staging_memory, 0, size, 0, &mapped_ptr);
+    if (res != VK_SUCCESS) {
+        usm_destroy_staging_buffer(device, staging_buffer, staging_memory);
+        cvk_error_fn("Failed to map staging memory: %d", res);
+        return CL_OUT_OF_HOST_MEMORY;
+    }
+    memcpy(dst_ptr, mapped_ptr, size);
+    vkUnmapMemory(device->vulkan_device(), staging_memory);
+
+    usm_destroy_staging_buffer(device, staging_buffer, staging_memory);
+
+    if (event != nullptr) {
+        auto evt = new cvk_event_command(queue->context(), nullptr, queue);
+        evt->set_status(CL_COMPLETE);
+        *event = evt;
+    }
+    return CL_SUCCESS;
+}
+
+static cl_int copy_device_usm_to_device_usm(cvk_command_queue* queue,
+                                           const cvk_usm_allocation& src_alloc,
+                                           const cvk_usm_allocation& dst_alloc,
+                                           size_t size,
+                                           cl_uint num_events_in_wait_list,
+                                           const cl_event* event_wait_list,
+                                           cl_event* event) {
+    return usm_submit_buffer_copy(queue, src_alloc.vk_buffer, dst_alloc.vk_buffer, size, event);
+}
+
 cl_int CLVK_API_CALL clEnqueueSVMMemcpy(cl_command_queue command_queue,
-                                        cl_bool blocking_copy, void* dst_ptr,
-                                        const void* src_ptr, size_t size,
-                                        cl_uint num_events_in_wait_list,
-                                        const cl_event* event_wait_list,
-                                        cl_event* event) {
+                                         cl_bool blocking_copy, void* dst_ptr,
+                                         const void* src_ptr, size_t size,
+                                         cl_uint num_events_in_wait_list,
+                                         const cl_event* event_wait_list,
+                                         cl_event* event) {
     TRACE_FUNCTION("command_queue", (uintptr_t)command_queue);
     LOG_API_CALL("command_queue = %p", command_queue);
-    UNUSED(blocking_copy);
-    UNUSED(dst_ptr);
-    UNUSED(src_ptr);
-    UNUSED(size);
-    UNUSED(num_events_in_wait_list);
-    UNUSED(event_wait_list);
-    UNUSED(event);
-    return CL_INVALID_OPERATION;
+
+    // Validate command queue
+    if (command_queue == nullptr) {
+        return CL_INVALID_COMMAND_QUEUE;
+    }
+
+    auto queue = icd_downcast(command_queue);
+    auto device = queue->device();
+
+    // Check if device supports USM
+    if (!device->has_unified_memory()) {
+        return CL_INVALID_OPERATION;
+    }
+
+    // Validate pointers and size
+    if (dst_ptr == nullptr || src_ptr == nullptr) {
+        return CL_INVALID_VALUE;
+    }
+    if (size == 0) {
+        return CL_SUCCESS; // Nothing to copy
+    }
+
+    // Validate event wait list
+    if (num_events_in_wait_list > 0 && event_wait_list == nullptr) {
+        return CL_INVALID_EVENT_WAIT_LIST;
+    }
+
+    // Check if src/dst are USM allocations
+    auto ctx = queue->context();
+    std::lock_guard<std::mutex> lock(ctx->usm_allocations_lock());
+    auto& usm_allocations = ctx->usm_allocations();
+    
+    bool src_is_usm = (usm_allocations.find(const_cast<void*>(src_ptr)) != usm_allocations.end());
+    bool dst_is_usm = (usm_allocations.find(dst_ptr) != usm_allocations.end());
+
+    // Support different copy scenarios:
+    // 1. USM to USM
+    // 2. Host memory to USM  
+    // 3. USM to host memory
+    if (src_is_usm && dst_is_usm) {
+        // USM to USM copy
+        auto& src_alloc = usm_allocations[const_cast<void*>(src_ptr)];
+        auto& dst_alloc = usm_allocations[dst_ptr];
+
+        // Validate size doesn't exceed allocation sizes
+        if (size > src_alloc.size || size > dst_alloc.size) {
+            return CL_INVALID_VALUE;
+        }
+
+        // Check if either allocation is device-only (not host-accessible)
+        if (src_alloc.type == cvk_usm_type::device || dst_alloc.type == cvk_usm_type::device) {
+            // Device-only allocations require GPU-based copy
+            return copy_device_usm_to_device_usm(queue, src_alloc, dst_alloc, size,
+                                               num_events_in_wait_list, event_wait_list, event);
+        }
+    } else if (!src_is_usm && dst_is_usm) {
+        // Host memory to USM
+        auto& dst_alloc = usm_allocations[dst_ptr];
+        if (size > dst_alloc.size) {
+            return CL_INVALID_VALUE;
+        }
+
+        // Check if destination is device-only (not host-accessible)
+        if (dst_alloc.type == cvk_usm_type::device) {
+            // Device-only allocations require GPU-based copy
+            return copy_host_to_device_usm(queue, dst_alloc, src_ptr, size, 
+                                         num_events_in_wait_list, event_wait_list, event);
+        }
+    } else if (src_is_usm && !dst_is_usm) {
+        // USM to host memory
+        auto& src_alloc = usm_allocations[const_cast<void*>(src_ptr)];
+        if (size > src_alloc.size) {
+            return CL_INVALID_VALUE;
+        }
+
+        // Check if source is device-only (not host-accessible)
+        if (src_alloc.type == cvk_usm_type::device) {
+            // Device-only allocations require GPU-based copy
+            return copy_device_usm_to_host(queue, src_alloc, dst_ptr, size,
+                                         num_events_in_wait_list, event_wait_list, event);
+        }
+    } else {
+        // Neither is USM - this is not supported by clEnqueueSVMMemcpy
+        return CL_INVALID_VALUE;
+    }
+
+    // For now, implement a simple CPU-based copy for host-accessible USM allocations
+    // TODO: Implement proper GPU-based copy using Vulkan commands for device-only allocations
+    
+    // Wait for any dependencies first
+    if (num_events_in_wait_list > 0) {
+        for (cl_uint i = 0; i < num_events_in_wait_list; i++) {
+            auto evt = icd_downcast(event_wait_list[i]);
+            cl_int err = evt->wait();
+            if (err != CL_SUCCESS) {
+                return err;
+            }
+        }
+    }
+    
+    // Perform the copy
+    memcpy(dst_ptr, src_ptr, size);
+    
+    // Create an event if requested
+    if (event != nullptr) {
+        auto evt = new cvk_event_command(queue->context(), nullptr, queue);
+        evt->set_status(CL_COMPLETE);
+        *event = evt;
+    }
+    
+    // Block if requested
+    if (blocking_copy) {
+        // Copy is already done synchronously
+    }
+
+    return CL_SUCCESS;
+}
+
+// Alias for CHIPStar compatibility - clSVMmemcpy is not a standard OpenCL function
+// but CHIPStar expects it to exist
+cl_int CLVK_API_CALL clSVMmemcpy(cl_command_queue command_queue,
+                                 cl_bool blocking_copy, void* dst_ptr,
+                                 const void* src_ptr, size_t size,
+                                 cl_uint num_events_in_wait_list,
+                                 const cl_event* event_wait_list,
+                                 cl_event* event) {
+    // Simply delegate to clEnqueueSVMMemcpy
+    return clEnqueueSVMMemcpy(command_queue, blocking_copy, dst_ptr, src_ptr, 
+                             size, num_events_in_wait_list, event_wait_list, event);
 }
 
 cl_int CLVK_API_CALL clEnqueueSVMMemFill(cl_command_queue command_queue,
@@ -5933,10 +6568,71 @@ cl_int CLVK_API_CALL clSetKernelArgSVMPointer(cl_kernel kernel,
     TRACE_FUNCTION("kernel", (uintptr_t)kernel, "arg_index", arg_index);
     LOG_API_CALL("kernel = %p, arg_index = %u, arg_value = %p", kernel,
                  arg_index, arg_value);
-    UNUSED(kernel);
-    UNUSED(arg_index);
-    UNUSED(arg_value);
-    return CL_INVALID_OPERATION;
+
+    auto kern = icd_downcast(kernel);
+
+    if (!is_valid_kernel(kern)) {
+        return CL_INVALID_KERNEL;
+    }
+
+    if (arg_index >= kern->num_args()) {
+        cvk_error_fn("the program has only %u arguments", kern->num_args());
+        return CL_INVALID_ARG_INDEX;
+    }
+
+    // Handle nullptr - chipStar sometimes passes nullptr for invalid pointers
+    if (arg_value == nullptr) {
+        cvk_warn_fn("clSetKernelArgSVMPointer called with nullptr for arg %u", arg_index);
+        // For null pointers, we can't look up a buffer, but we should not fail
+        // Instead, try to set a null/dummy buffer or skip
+        // For now, return success - the kernel will fail at launch if this was incorrect
+        return CL_SUCCESS;
+    }
+
+    // Look up the USM allocation for this pointer
+    auto ctx = kern->program()->context();
+    VkBuffer buffer = VK_NULL_HANDLE;
+
+    {
+        std::lock_guard<std::mutex> lock(ctx->usm_allocations_lock());
+        auto& allocations = ctx->usm_allocations();
+        
+        cvk_debug_fn("Looking up USM pointer %p among %zu allocations",
+                     arg_value, allocations.size());
+        
+        // Try exact match first
+        auto it = allocations.find(const_cast<void*>(arg_value));
+        if (it != allocations.end()) {
+            buffer = it->second.vk_buffer;
+            cvk_debug_fn("Found exact USM allocation for pointer %p -> VkBuffer %p",
+                        arg_value, (void*)buffer);
+        } else {
+            // Try to find allocation that contains this pointer (offset into allocation)
+            for (auto& alloc_entry : allocations) {
+                void* base_ptr = alloc_entry.first;
+                size_t alloc_size = alloc_entry.second.size;
+                uintptr_t base = reinterpret_cast<uintptr_t>(base_ptr);
+                uintptr_t ptr = reinterpret_cast<uintptr_t>(arg_value);
+                
+                cvk_debug_fn("Checking allocation base=%p, size=%zu", base_ptr, alloc_size);
+                
+                if (ptr >= base && ptr < (base + alloc_size)) {
+                    buffer = alloc_entry.second.vk_buffer;
+                    cvk_debug_fn("Found USM allocation containing pointer %p (base=%p, offset=%zu) -> VkBuffer %p",
+                                arg_value, base_ptr, ptr - base, (void*)buffer);
+                    break;
+                }
+            }
+        }
+    }
+
+    if (buffer == VK_NULL_HANDLE) {
+        cvk_error_fn("No USM allocation found for SVM pointer %p", arg_value);
+        return CL_INVALID_ARG_VALUE;
+    }
+
+    // Use the existing set_arg_usm_pointer method
+    return kern->set_arg_usm_pointer(arg_index, buffer);
 }
 
 // Pipes

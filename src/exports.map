@@ -114,6 +114,7 @@ OPENCL_2.0 {
     clSVMFree;
     clEnqueueSVMFree;
     clEnqueueSVMMemcpy;
+    clSVMmemcpy;
     clEnqueueSVMMemFill;
     clEnqueueSVMMap;
     clEnqueueSVMUnmap;
