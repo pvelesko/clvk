@@ -209,3 +209,4 @@ TEST_F(WithCommandQueue, SpirvProgramLinkingTest) {
     for (auto prog : programs) {
         clReleaseProgram(prog);
     }
+}
