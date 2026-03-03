@@ -14,6 +14,9 @@
 
 #pragma once
 
+#include <unordered_map>
+#include <mutex>
+
 #include "device.hpp"
 #include "objects.hpp"
 #include "unit.hpp"
@@ -27,6 +30,21 @@ using cvk_context_callback_pointer_type = void(CL_CALLBACK*)(cl_context context,
 struct cvk_context_callback {
     cvk_context_callback_pointer_type pointer;
     void* data;
+};
+
+// USM allocation metadata
+enum class cvk_usm_type {
+    shared,  // CPU and GPU accessible
+    host,    // CPU-optimized, GPU accessible
+    device   // GPU-only, NOT CPU accessible
+};
+
+struct cvk_usm_allocation {
+    void* host_pointer;      // nullptr for device-only allocations
+    VkDeviceMemory vk_memory;
+    VkBuffer vk_buffer;
+    size_t size;
+    cvk_usm_type type;
 };
 
 struct cvk_command_queue;
@@ -138,6 +156,12 @@ struct cvk_context : public _cl_context,
     cvk_command_queue* get_or_create_image_init_command_queue();
     void free_image_init_command_queue();
 
+    // USM allocation management
+    std::mutex& usm_allocations_lock() { return m_usm_allocations_lock; }
+    std::unordered_map<void*, cvk_usm_allocation>& usm_allocations() {
+        return m_usm_allocations;
+    }
+
 private:
     cvk_device* m_device;
     std::mutex m_callbacks_lock;
@@ -149,6 +173,10 @@ private:
 
     std::mutex m_queue_image_init_lock;
     cvk_command_queue* m_queue_image_init = nullptr;
+
+    // USM allocations tracking
+    std::mutex m_usm_allocations_lock;
+    std::unordered_map<void*, cvk_usm_allocation> m_usm_allocations;
 };
 
 static inline cvk_context* icd_downcast(cl_context context) {

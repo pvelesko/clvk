@@ -730,6 +730,8 @@ void cvk_device::build_extension_ils_list() {
             1, 0, 0, "cl_arm_integer_dot_product_accumulate_int16"));
     }
 
+    // USM extension will be added after init_unified_memory() is called
+
     auto split_string = [](std::string input, char delimiter) {
         std::vector<std::string> outputs;
         size_t pos = 0;
@@ -1162,6 +1164,63 @@ void cvk_device::log_limits_and_memory_information() {
     }
 }
 
+void cvk_device::init_unified_memory() {
+    // Look for a memory type that is device-local, host-visible, and host-coherent
+    // This indicates unified memory architecture (UMA) suitable for USM
+    for (uint32_t i = 0; i < m_mem_properties.memoryTypeCount; i++) {
+        auto flags = m_mem_properties.memoryTypes[i].propertyFlags;
+        bool is_device_local = (flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0;
+        bool is_host_visible = (flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0;
+        bool is_host_coherent = (flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0;
+        
+        // For USM, we need device-local and host-visible memory
+        // Host-coherent is preferred but not strictly required
+        if (is_device_local && is_host_visible) {
+            m_unified_memory_type_index = i;
+            if (is_host_coherent) {
+                cvk_info("Unified memory detected at memory type %u (DEVICE_LOCAL|HOST_VISIBLE|HOST_COHERENT) - USM support enabled", i);
+            } else {
+                cvk_info("Unified memory detected at memory type %u (DEVICE_LOCAL|HOST_VISIBLE) - USM support enabled (coherent=false)", i);
+            }
+            return;
+        }
+    }
+    
+    cvk_info("No unified memory type found (USM not available)");
+}
+
+uint32_t cvk_device::device_memory_type_index(uint32_t type_bits) const {
+    // Try to find device-local memory without host-visible
+    for (uint32_t i = 0; i < m_mem_properties.memoryTypeCount; i++) {
+        if ((type_bits & (1 << i)) == 0) {
+            continue;  // Not suitable for this buffer
+        }
+        auto flags = m_mem_properties.memoryTypes[i].propertyFlags;
+        bool is_device_local = (flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0;
+        bool is_host_visible = (flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0;
+        
+        // Device memory: local but not host visible
+        if (is_device_local && !is_host_visible) {
+            return i;
+        }
+    }
+
+    // Fallback: if no device-only memory, use device-local + host-visible
+    // (This happens on UMA systems like Apple Silicon)
+    for (uint32_t i = 0; i < m_mem_properties.memoryTypeCount; i++) {
+        if ((type_bits & (1 << i)) == 0) {
+            continue;
+        }
+        auto flags = m_mem_properties.memoryTypes[i].propertyFlags;
+        if (flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) {
+            cvk_warn("No device-only memory available, using unified memory for device allocation");
+            return i;
+        }
+    }
+
+    return VK_MAX_MEMORY_TYPES;
+}
+
 bool cvk_device::init(VkInstance instance) {
     cvk_info("Initialising device %s", m_properties.deviceName);
     cvk_info("  API Version: %s",
@@ -1199,6 +1258,21 @@ bool cvk_device::init(VkInstance instance) {
     init_spirv_environment();
 
     log_limits_and_memory_information();
+
+    // Detect unified memory for USM support
+    init_unified_memory();
+
+    // Add USM extension after unified memory detection
+    if (has_unified_memory()) {
+        m_extensions.push_back(MAKE_NAME_VERSION(1, 0, 0, "cl_intel_unified_shared_memory"));
+        
+        // Rebuild extension string to include the new extension
+        m_extension_string.clear();
+        for (auto& ext : m_extensions) {
+            m_extension_string += ext.name;
+            m_extension_string += " ";
+        }
+    }
 
     // Must be done last as it relies on info set up in several of the above.
     init_compiler_options();

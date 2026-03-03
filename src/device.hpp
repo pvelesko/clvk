@@ -694,6 +694,10 @@ struct cvk_device : public _cl_device_id,
     cl_uint address_bits() const { return m_spirv_arch == "spir64" ? 64 : 32; }
     bool uses_physical_addressing() const { return m_physical_addressing; }
 
+    bool has_unified_memory() const { return m_unified_memory_type_index != VK_MAX_MEMORY_TYPES; }
+    uint32_t unified_memory_type_index() const { return m_unified_memory_type_index; }
+    uint32_t device_memory_type_index(uint32_t type_bits) const;
+
     const std::string& get_device_specific_compile_options() const {
         return m_device_compiler_options;
     }
@@ -739,6 +743,7 @@ private:
     CHECK_RETURN bool init_time_management(VkInstance instance);
     void init_spirv_environment();
     void log_limits_and_memory_information();
+    void init_unified_memory();
     CHECK_RETURN bool init(VkInstance instance);
 
     cvk_platform* m_platform;
@@ -775,6 +780,8 @@ private:
     VkPhysicalDeviceBufferDeviceAddressFeaturesKHR
         m_features_buffer_device_address{};
     VkPhysicalDeviceFloatControlsProperties m_float_controls_properties{};
+    
+    uint32_t m_unified_memory_type_index{VK_MAX_MEMORY_TYPES};
     VkPhysicalDeviceShaderIntegerDotProductFeatures
         m_features_shader_integer_dot_product{};
     VkPhysicalDeviceGlobalPriorityQueryFeaturesKHR
