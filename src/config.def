@@ -19,7 +19,7 @@ OPTION(std::string, cache_dir, "")
 OPTION(std::string, compiler_temp_dir, "")
 OPTION(bool, skip_spirv_capability_check, false)
 OPTION(bool, keep_temporaries, false)
-OPTION(std::string, spirv_arch, "spir")
+OPTION(std::string, spirv_arch, "spir64")
 OPTION(bool, physical_addressing, false)
 
 OPTION(std::string, clspv_native_builtins, "")
