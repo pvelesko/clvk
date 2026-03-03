@@ -79,6 +79,8 @@ struct kernel_argument {
     kernel_argument_kind kind;
     uint32_t local_spec_id;
     uint32_t local_elem_size;
+    // MoltenVK workaround: store element type for StorageBuffer descriptors
+    std::string element_type;  // e.g., "float", "uint", "int", etc.
 
     bool is_pod() const {
         return (kind == kernel_argument_kind::pod) ||
